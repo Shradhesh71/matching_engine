@@ -1,0 +1,19 @@
+[workspace.package]
+name = "matching_engine"
+version = "0.1.0"
+edition = "2024"
+description = "prediction-matching-engine"
+readme = "README.md"
+
+[workspace]
+members = ["shared", "crates/engine", "crates/server"]
+resolver = "2"
+
+[workspace.dependencies]
+serde = {version = "1.0.228", features = ["derive"]}
+serde_json = "1.0.149"
+tokio = {version = "1.50.0", features = ["full"]}
+tracing = "0.1.44"
+tracing-subscriber = {version = "0.3.23", features = ["env-filter"] }
+anyhow = "1.0.102"
+shared      = { path = "shared" }
