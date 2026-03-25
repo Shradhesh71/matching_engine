@@ -2,7 +2,7 @@
 name = "matching_engine"
 version = "0.1.0"
 edition = "2024"
-description = "matching-engine"
+description = "prediction-matching-engine"
 readme = "README.md"
 
 [workspace]
