@@ -3,18 +3,18 @@ mod order_book;
 use std::sync::Arc;
 
 use anyhow::Result;
-use order_book::OrderBook;
-use shared::{EngineRequest, EngineResponse, EnginePush, Order};
+use shared::{EngineRequest, EngineResponse, EnginePush};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::{broadcast, Mutex},
+    sync::{broadcast, mpsc,Mutex},
 };
 use tracing::{error, info, warn};
 
-/// shared state: one order book + broadcast channel for fill events
+use crate::order_book::MatchCommand;
+
 struct EngineState {
-    book:          Mutex<OrderBook>,
+    cmd_tx:  mpsc::Sender<MatchCommand>, 
     fill_tx:       broadcast::Sender<shared::Fill>,
 }
 
@@ -30,11 +30,18 @@ async fn main() -> Result<()> {
     let addr = std::env::var("ENGINE_ADDR").unwrap_or_else(|_| "127.0.0.1:8000".into());
     let listener = TcpListener::bind(&addr).await?;
     info!("engine listening on {addr}");
-
+    
+    let (cmd_tx, cmd_rx) = mpsc::channel::<MatchCommand>(1024);
     let (fill_tx, _) = broadcast::channel::<shared::Fill>(1024);
 
+    let fill_tx_match    = fill_tx.clone();
+ 
+    std::thread::spawn(move || {
+        order_book::run_matching_thread(cmd_rx, fill_tx_match);
+    });
+
     let state = Arc::new(EngineState {
-        book:    Mutex::new(OrderBook::new()),
+        cmd_tx,
         fill_tx,
     });
 
@@ -106,25 +113,40 @@ async fn handle_connection(stream: TcpStream, state: Arc<EngineState>) -> Result
 async fn process_request(req: EngineRequest, state: &EngineState) -> EngineResponse {
     match req {
         EngineRequest::SubmitOrder { side, price, qty } => {
-            let (order_id, fills) = {
-                let mut book = state.book.lock().await;
-                let id = book.next_id();
-                let order = Order { id, side, price, qty };
-                let fills = book.submit(order);
-                (id, fills)
-            }; // lock released here
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
-            for fill in &fills {
-                let _ = state.fill_tx.send(fill.clone());
+            let cmd = MatchCommand::Submit {
+                side, price, qty,
+                reply: reply_tx,
+            };
+ 
+            if state.cmd_tx.send(cmd).await.is_err() {
+                return EngineResponse::Error { message: "matching thread unavailable".into() };
             }
 
-            EngineResponse::Accepted { order_id, fills }
+            match reply_rx.await {
+                Ok((order_id, fills)) => {
+                    // broadcast fills to all connected API servers
+                    for fill in &fills {
+                        let _ = state.fill_tx.send(fill.clone());
+                    }
+                    EngineResponse::Accepted { order_id, fills }
+                }
+                Err(_) => EngineResponse::Error { message: "matching thread dropped reply".into() },
+            }
         }
 
         EngineRequest::GetOrderBook => {
-            let book = state.book.lock().await;
-            let (bids, asks) = book.snapshot();
-            EngineResponse::OrderBook { bids, asks }
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+            if state.cmd_tx.send(MatchCommand::Snapshot { reply: reply_tx }).await.is_err() {
+                return EngineResponse::Error { message: "matching thread unavailable".into() };
+            }
+ 
+            match reply_rx.await {
+                Ok((bids, asks)) => EngineResponse::OrderBook { bids, asks },
+                Err(_) => EngineResponse::Error { message: "matching thread dropped reply".into() },
+            }
         }
     }
 }
