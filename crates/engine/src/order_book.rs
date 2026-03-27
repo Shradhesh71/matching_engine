@@ -1,6 +1,17 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::{collections::{BTreeMap, VecDeque}};
 
 use shared::{Fill, Order, PriceLevel, Side};
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+pub enum MatchCommand {
+    Submit {
+        side: Side, price: u64, qty: u64,
+        reply: oneshot::Sender<(u64, Vec<Fill>)>,  // (order_id, fills)
+    },
+    Snapshot {
+        reply: oneshot::Sender<(Vec<PriceLevel>, Vec<PriceLevel>)>,
+    },
+}
 
 /// each side is a `BTreeMap<u64, VecDeque<Order>>`:
 pub struct OrderBook {
@@ -140,5 +151,35 @@ impl OrderBook {
             .collect();
 
         (bids, asks)
+    }
+    
+}
+
+pub fn run_matching_thread(
+    mut cmd_rx: mpsc::Receiver<MatchCommand>,
+    fill_tx:    broadcast::Sender<Fill>,
+) {
+    let mut book = OrderBook::new();
+ 
+    // zero CPU burn while idle, no spinning, no wakeup overhead.
+    while let Some(cmd) = cmd_rx.blocking_recv() {
+        match cmd {
+            MatchCommand::Submit { side, price, qty, reply } => {
+                let id    = book.next_id();
+                let order = Order { id, side, price, qty };
+                let fills = book.submit(order);
+ 
+                // broadcast fills before replying so WS clients are notified as early as possible
+                for fill in &fills {
+                    let _ = fill_tx.send(fill.clone());
+                }
+
+                let _ = reply.send((id, fills));
+            }
+ 
+            MatchCommand::Snapshot { reply } => {
+                let _ = reply.send(book.snapshot());
+            }
+        }
     }
 }
